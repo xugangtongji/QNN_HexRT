@@ -1,7 +1,9 @@
 #include <qhexrt/qhexrt_c.h>
 
-#include "qhexrt_internal.hpp"
+#include "lfm_manifest.hpp"
 #include "lfm_runner.hpp"
+#include "model_capabilities.hpp"
+#include "qhexrt_internal.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -12,6 +14,7 @@
 #include <new>
 #include <regex>
 #include <string>
+#include <string_view>
 
 namespace fs = std::filesystem;
 namespace {
@@ -76,32 +79,14 @@ bool regular_nonempty(const fs::path& path) {
   return fs::is_regular_file(path, ec) && fs::file_size(path, ec) > 0;
 }
 
-bool load_lfm_manifest(qhx_model& model, const std::string& json) {
-  std::string family;
-  if (!json_string(json, "name", model.name) || !json_string(json, "family", family) ||
-      family != "llm" || !json_string(json, "dsp_arch", model.dsp_arch) ||
-      !json_int(json, "hidden", model.hidden) || !json_int(json, "vocab", model.vocab) ||
-      !json_int(json, "max_ctx", model.max_ctx) || !json_int(json, "kv_dim", model.kv_dim) ||
-      !json_int(json, "head_dim", model.head_dim) ||
-      !json_int(json, "eos_token_id", model.eos_token_id) ||
-      !json_double(json, "rope_theta", model.rope_theta)) {
-    last_error = "Manifest is missing required LLM fields";
-    return false;
-  }
-  if (model.name != "lfm2-5-230m" || model.hidden != 1024 || model.vocab != 65536 ||
-      model.max_ctx <= 0 || model.kv_dim != 512 || model.head_dim != 64) {
-    last_error = "Only the verified lfm2-5-230m graph contract is supported by this MVP";
-    return false;
-  }
-  std::string prefill_bin, decode_bin, lmhead_bin;
-  if (!artifact_string(json, "prefill", "bin", prefill_bin) ||
-      !artifact_string(json, "decode", "bin", decode_bin) ||
-      !artifact_string(json, "lmhead", "bin", lmhead_bin) ||
-      !json_string(json, "embed", model.embedding_path) ||
-      !json_string(json, "tokenizer", model.tokenizer_path)) {
-    last_error = "Manifest is missing LFM artifacts";
-    return false;
-  }
+qhx_hexagon_architectures architecture_mask(std::string_view architecture) {
+  if (architecture == "v75") return QHX_HEXAGON_ARCH_V75;
+  if (architecture == "v79") return QHX_HEXAGON_ARCH_V79;
+  if (architecture == "v81") return QHX_HEXAGON_ARCH_V81;
+  return QHX_HEXAGON_ARCH_NONE;
+}
+
+bool load_lfm_assets(qhx_model& model) {
   const fs::path tokenizer = resolve_artifact(model, model.tokenizer_path);
   const fs::path embedding = resolve_artifact(model, model.embedding_path);
   if (!regular_nonempty(tokenizer) || !regular_nonempty(embedding)) {
@@ -117,14 +102,43 @@ bool load_lfm_manifest(qhx_model& model, const std::string& json) {
   }
   model.tokenizer_path = tokenizer.string();
   model.embedding_path = embedding.string();
-  if (!model.embedding.open(model.embedding_path, qhx::MappingAccess::kRandom, last_error))
+  if (!model.embedding.open(model.embedding_path, qhx::MappingAccess::kRandom, last_error)) {
     return false;
+  }
   if (model.embedding.size() != expected_embedding) {
     last_error = "Mapped embedding table size changed during model loading";
     return false;
   }
   model.tokenizer = std::make_unique<qhx::Tokenizer>();
-  if (!model.tokenizer->load(model.tokenizer_path, last_error)) return false;
+  return model.tokenizer->load(model.tokenizer_path, last_error);
+}
+
+bool load_lfm2_split_v1(qhx_model& model, const std::string& json) {
+  if (!json_int(json, "hidden", model.hidden) || !json_int(json, "vocab", model.vocab) ||
+      !json_int(json, "max_ctx", model.max_ctx) || !json_int(json, "kv_dim", model.kv_dim) ||
+      !json_int(json, "head_dim", model.head_dim) ||
+      !json_int(json, "eos_token_id", model.eos_token_id) ||
+      !json_double(json, "rope_theta", model.rope_theta)) {
+    last_error = "Manifest is missing required LFM2 split-v1 fields";
+    return false;
+  }
+  if (model.model_id != QHX_MODEL_LFM2_5_230M || model.hidden != 1024 ||
+      model.vocab != 65536 || model.max_ctx <= 0 || model.kv_dim != 512 ||
+      model.head_dim != 64) {
+    last_error = "Manifest does not match the verified LFM2 split-v1 graph contract";
+    return false;
+  }
+  model.bos_token_id = 1;
+  std::string prefill_bin, decode_bin, lmhead_bin;
+  if (!artifact_string(json, "prefill", "bin", prefill_bin) ||
+      !artifact_string(json, "decode", "bin", decode_bin) ||
+      !artifact_string(json, "lmhead", "bin", lmhead_bin) ||
+      !json_string(json, "embed", model.embedding_path) ||
+      !json_string(json, "tokenizer", model.tokenizer_path)) {
+    last_error = "Manifest is missing LFM artifacts";
+    return false;
+  }
+  if (!load_lfm_assets(model)) return false;
   model.prefill = std::make_unique<qhx::ContextGraph>();
   model.decode = std::make_unique<qhx::ContextGraph>();
   model.lmhead = std::make_unique<qhx::ContextGraph>();
@@ -138,6 +152,108 @@ bool load_lfm_manifest(qhx_model& model, const std::string& json) {
     return false;
   }
   return qhx::prepare_lfm_model(model, last_error);
+}
+
+bool load_lfm2_shared_v1(qhx_model& model, const std::string& json) {
+  qhx::LfmManifest manifest;
+  if (!qhx::parse_lfm_manifest_v1(json, manifest, last_error)) return false;
+  if (model.model_id != QHX_MODEL_LFM2_5_350M ||
+      manifest.name != "lfm2-5-350m-2048" || manifest.family != "llm" ||
+      manifest.dsp_arch != "v79" ||
+      manifest.context_layout != qhx::LfmContextLayout::kSharedBody ||
+      manifest.prefill.binary_path != manifest.decode.binary_path ||
+      manifest.prefill.graph_name != "lfm_pf_512_f16" ||
+      manifest.decode.graph_name != "lfm_dec_2048_f16" ||
+      manifest.lmhead.graph_name != "lfm_lmh_f16" || manifest.hidden != 1024 ||
+      manifest.vocab != 65536 || manifest.layers != 16 ||
+      manifest.max_context != 2048 || manifest.kv_dimension != 512 ||
+      manifest.head_dimension != 64 || manifest.bos_token_id != 1 ||
+      manifest.eos_token_id != 7) {
+    last_error = "Manifest does not match the verified LFM2 shared-v1 graph contract";
+    return false;
+  }
+
+  model.hidden = manifest.hidden;
+  model.vocab = manifest.vocab;
+  model.max_ctx = manifest.max_context;
+  model.kv_dim = manifest.kv_dimension;
+  model.head_dim = manifest.head_dimension;
+  model.bos_token_id = manifest.bos_token_id;
+  model.eos_token_id = manifest.eos_token_id;
+  model.rope_theta = manifest.rope_theta;
+  model.embedding_path = manifest.embedding_path;
+  model.tokenizer_path = manifest.tokenizer_path;
+  if (!load_lfm_assets(model)) return false;
+
+  auto shared_context = std::make_shared<qhx::ContextBinary>();
+  auto& runtime = model.runtime->impl;
+  if (!shared_context->load(
+          runtime, resolve_artifact(model, manifest.prefill.binary_path).string(),
+          last_error)) {
+    return false;
+  }
+  model.prefill = std::make_unique<qhx::ContextGraph>();
+  model.decode = std::make_unique<qhx::ContextGraph>();
+  model.lmhead = std::make_unique<qhx::ContextGraph>();
+  if (!model.prefill->load(shared_context, manifest.prefill.graph_name, last_error) ||
+      !model.decode->load(shared_context, manifest.decode.graph_name, last_error) ||
+      !model.lmhead->load(
+          runtime, resolve_artifact(model, manifest.lmhead.binary_path).string(),
+          manifest.lmhead.graph_name, last_error)) {
+    return false;
+  }
+  return qhx::prepare_lfm_model(model, last_error);
+}
+
+bool load_model_manifest(qhx_model& model, const std::string& json) {
+  std::string family;
+  if (!json_string(json, "name", model.name) || !json_string(json, "family", family) ||
+      !json_string(json, "dsp_arch", model.dsp_arch)) {
+    last_error = "Manifest is missing required model identity fields";
+    return false;
+  }
+
+  const qhx_model_capability* capability =
+      qhx::find_model_capability_by_manifest(model.name);
+  if (!capability) {
+    last_error = "Unsupported QHexRT manifest model: " + model.name;
+    return false;
+  }
+  if (family != "llm" || capability->family != QHX_MODEL_FAMILY_LLM) {
+    last_error = "Manifest family does not match the declared model capability";
+    return false;
+  }
+
+  const qhx_hexagon_architectures manifest_architecture =
+      architecture_mask(model.dsp_arch);
+  if (manifest_architecture == QHX_HEXAGON_ARCH_NONE ||
+      (capability->architectures & manifest_architecture) == 0U) {
+    last_error = "Manifest architecture is not declared for model: " +
+                 std::string(capability->catalog_id);
+    return false;
+  }
+  if (model.dsp_arch != model.runtime->impl.arch) {
+    last_error = "Model DSP architecture does not match runtime device";
+    return false;
+  }
+  if (capability->support_state != QHX_MODEL_SUPPORT_EXECUTABLE) {
+    last_error = "Model is declared but not executable in this QHexRT build: " +
+                 std::string(capability->catalog_id);
+    return false;
+  }
+
+  model.model_id = capability->model_id;
+  model.runner = capability->runner;
+  model.graph_contract = capability->graph_contract;
+  switch (model.graph_contract) {
+    case QHX_GRAPH_CONTRACT_LFM2_SPLIT_V1:
+      return load_lfm2_split_v1(model, json);
+    case QHX_GRAPH_CONTRACT_LFM2_SHARED_V1:
+      return load_lfm2_shared_v1(model, json);
+    default:
+      last_error = "Executable model capability has no supported graph contract";
+      return false;
+  }
 }
 
 bool cancelled(qhx_session* session, const qhx_generate_options* options) {
@@ -177,6 +293,7 @@ qhx_status qhx_runtime_device(qhx_runtime* runtime, char* arch, size_t arch_size
 qhx_model* qhx_model_load(qhx_runtime* runtime, const char* manifest_path,
                           const char* artifacts_dir) {
   if (!runtime || !manifest_path || !*manifest_path) return nullptr;
+  last_error.clear();
   auto model = std::unique_ptr<qhx_model>(new (std::nothrow) qhx_model());
   if (!model) return nullptr;
   model->runtime = runtime;
@@ -185,11 +302,7 @@ qhx_model* qhx_model_load(qhx_runtime* runtime, const char* manifest_path,
                              ? artifacts_dir
                              : fs::path(manifest_path).parent_path().string();
   const std::string json = read_text(manifest_path);
-  if (json.empty() || !load_lfm_manifest(*model, json)) return nullptr;
-  if (model->dsp_arch != runtime->impl.arch) {
-    last_error = "Model DSP architecture does not match runtime device";
-    return nullptr;
-  }
+  if (json.empty() || !load_model_manifest(*model, json)) return nullptr;
   return model.release();
 }
 
@@ -207,7 +320,8 @@ void qhx_session_reset(qhx_session* session) {
   if (!session) return;
   session->cancelled.store(false, std::memory_order_release);
   session->output_text.clear();
-  qhx::reset_lfm_session(*session);
+  if (session->model && session->model->runner == QHX_RUNNER_LFM2)
+    qhx::reset_lfm_session(*session);
 }
 void qhx_session_cancel(qhx_session* session) {
   if (session) session->cancelled.store(true, std::memory_order_release);
@@ -246,8 +360,14 @@ qhx_status qhx_generate_ex(qhx_session* session, const qhx_inputs* inputs,
   if (cancelled(session, options)) return QHX_ERROR_CANCELLED;
   qhx_gen_cfg defaults;
   qhx_gen_cfg_default(&defaults);
-  return qhx::run_lfm(*session, *inputs, config ? *config : defaults, options,
-                      callback, callback_user, *output, last_error);
+  if (session->model->runner == QHX_RUNNER_LFM2 &&
+      (session->model->graph_contract == QHX_GRAPH_CONTRACT_LFM2_SPLIT_V1 ||
+       session->model->graph_contract == QHX_GRAPH_CONTRACT_LFM2_SHARED_V1)) {
+    return qhx::run_lfm(*session, *inputs, config ? *config : defaults, options,
+                        callback, callback_user, *output, last_error);
+  }
+  last_error = "Model has no executable runner in this QHexRT build";
+  return QHX_ERROR_UNSUPPORTED;
 }
 
 const char* qhx_status_str(qhx_status status) {
@@ -266,6 +386,6 @@ const char* qhx_status_str(qhx_status status) {
   }
 }
 
-const char* qhx_version(void) { return "QHexRT/0.1.0 ABI-1.1 QAIRT-2.48"; }
+const char* qhx_version(void) { return "QHexRT/0.1.0 ABI-1.3 QAIRT-2.48"; }
 
 }  // extern "C"

@@ -57,6 +57,21 @@ def source_git_identity() -> tuple[str, bool]:
     return git_sha, bool(status.stdout.strip())
 
 
+def c_abi_identity() -> dict[str, int]:
+    header = (ROOT / "include/qhexrt/qhexrt_c.h").read_text(encoding="utf-8")
+
+    def value(name: str) -> int:
+        match = re.search(rf"^#define {name} ([0-9]+)$", header, re.MULTILINE)
+        if not match:
+            raise SystemExit(f"missing integer ABI macro in qhexrt_c.h: {name}")
+        return int(match.group(1))
+
+    return {
+        "major": value("QHX_ABI_VERSION_MAJOR"),
+        "minor": value("QHX_ABI_VERSION_MINOR"),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sdk-root", required=True, type=pathlib.Path)
@@ -128,7 +143,7 @@ def main() -> None:
     receipt = {
         "artifacts": artifacts,
         "build": build,
-        "c_abi": {"major": 1, "minor": 1},
+        "c_abi": c_abi_identity(),
         "qhexrt_version": "0.1.0",
         "schema": "qhexrt-build-receipt/v1",
         "source": source,

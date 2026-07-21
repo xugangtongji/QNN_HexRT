@@ -18,15 +18,20 @@ struct qhx_runtime {
 
 struct qhx_model {
   qhx_runtime* runtime = nullptr;
+  qhx_model_id model_id = QHX_MODEL_UNKNOWN;
+  qhx_runner_kind runner = QHX_RUNNER_UNKNOWN;
+  qhx_graph_contract graph_contract = QHX_GRAPH_CONTRACT_UNKNOWN;
   std::string manifest_path;
   std::string artifacts_dir;
   std::string name;
   std::string dsp_arch;
   int hidden = 0;
   int vocab = 0;
+  int prefill_ctx = 0;
   int max_ctx = 0;
   int kv_dim = 0;
   int head_dim = 0;
+  int bos_token_id = -1;
   int eos_token_id = -1;
   double rope_theta = 0.0;
   std::string tokenizer_path;

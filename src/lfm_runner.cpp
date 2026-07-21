@@ -123,6 +123,17 @@ bool validate_bytes(const ContextGraph::TensorDef& tensor, size_t expected,
   return false;
 }
 
+bool validate_fp16(const std::vector<ContextGraph::TensorDef>& tensors,
+                   std::string_view graph, std::string& error) {
+  for (const auto& tensor : tensors) {
+    if (tensor.data_type != QNN_DATATYPE_FLOAT_16) {
+      error = "LFM graph tensor is not FP16: " + std::string(graph) + "." + tensor.name;
+      return false;
+    }
+  }
+  return true;
+}
+
 bool create_bindings(const qhx_model& model, LfmBindings& bindings, std::string& error) {
   if (!require_tensor(model.prefill->inputs, "x", bindings.prefill_x, error) ||
       !require_tensor(model.prefill->inputs, "cos", bindings.prefill_cos, error) ||
@@ -140,12 +151,20 @@ bool create_bindings(const qhx_model& model, LfmBindings& bindings, std::string&
     error = "LFM lmhead graph contract mismatch";
     return false;
   }
+  if (!validate_fp16(model.prefill->inputs, "prefill.input", error) ||
+      !validate_fp16(model.prefill->outputs, "prefill.output", error) ||
+      !validate_fp16(model.decode->inputs, "decode.input", error) ||
+      !validate_fp16(model.decode->outputs, "decode.output", error) ||
+      !validate_fp16(model.lmhead->inputs, "lmhead.input", error) ||
+      !validate_fp16(model.lmhead->outputs, "lmhead.output", error)) {
+    return false;
+  }
 
   const size_t hidden_bytes = static_cast<size_t>(model.hidden) * 2U;
-  const size_t prefill_hidden_bytes = static_cast<size_t>(model.max_ctx) * hidden_bytes;
-  const size_t rope_bytes = static_cast<size_t>(model.max_ctx) * model.head_dim * 2U;
+  const size_t prefill_hidden_bytes = static_cast<size_t>(model.prefill_ctx) * hidden_bytes;
+  const size_t rope_bytes = static_cast<size_t>(model.prefill_ctx) * model.head_dim * 2U;
   const size_t prefill_mask_bytes =
-      static_cast<size_t>(model.max_ctx) * model.max_ctx * 2U;
+      static_cast<size_t>(model.prefill_ctx) * model.prefill_ctx * 2U;
   const size_t decode_mask_bytes = static_cast<size_t>(model.max_ctx) * 2U;
   const size_t logits_bytes = static_cast<size_t>(model.vocab) * 2U;
   if (!validate_bytes(model.prefill->inputs[bindings.prefill_x], prefill_hidden_bytes,
@@ -173,12 +192,16 @@ bool create_bindings(const qhx_model& model, LfmBindings& bindings, std::string&
 
   bindings.lmhead_input = 0;
   bindings.lmhead_output = 0;
+  const size_t new_kv_bytes = static_cast<size_t>(model.kv_dim) * 2U;
+  const size_t prefill_kv_bytes = static_cast<size_t>(model.prefill_ctx) * new_kv_bytes;
+  const size_t past_kv_bytes = static_cast<size_t>(model.max_ctx) * new_kv_bytes;
   for (size_t destination = 0; destination < model.decode->inputs.size(); ++destination) {
     const auto& input = model.decode->inputs[destination];
     if (input.name.rfind("past_k_", 0) == 0 || input.name.rfind("past_v_", 0) == 0) {
       const std::string source_name = "new_" + input.name.substr(5);
       const auto source = tensor_index(model.prefill->outputs, source_name);
-      if (!source || model.prefill->outputs[*source].bytes != input.bytes) {
+      if (!source || model.prefill->outputs[*source].bytes != prefill_kv_bytes ||
+          input.bytes != past_kv_bytes || prefill_kv_bytes > past_kv_bytes) {
         error = "LFM prefill/decode KV contract mismatch: " + input.name;
         return false;
       }
@@ -196,8 +219,6 @@ bool create_bindings(const qhx_model& model, LfmBindings& bindings, std::string&
     }
   }
 
-  const size_t new_kv_bytes = static_cast<size_t>(model.kv_dim) * 2U;
-  const size_t past_kv_bytes = static_cast<size_t>(model.max_ctx) * new_kv_bytes;
   for (size_t source = 0; source < model.decode->outputs.size(); ++source) {
     const auto& output = model.decode->outputs[source];
     if (output.name.rfind("new_k_", 0) == 0 || output.name.rfind("new_v_", 0) == 0) {
@@ -408,8 +429,12 @@ struct LfmWorkspace {
     prefill_outputs.resize(model.prefill->outputs.size());
     std::vector<size_t> skipped_decode_inputs;
     skipped_decode_inputs.reserve(bindings.prefill_kv_to_decode.size());
-    for (const auto& transfer : bindings.prefill_kv_to_decode)
-      skipped_decode_inputs.push_back(transfer.destination);
+    for (const auto& transfer : bindings.prefill_kv_to_decode) {
+      if (model.prefill->outputs[transfer.source].bytes ==
+          model.decode->inputs[transfer.destination].bytes) {
+        skipped_decode_inputs.push_back(transfer.destination);
+      }
+    }
     decode_inputs = allocate_inputs(model.decode->inputs, skipped_decode_inputs);
     decode_outputs.resize(model.decode->outputs.size());
     lmhead_inputs = allocate_inputs(model.lmhead->inputs);
@@ -418,9 +443,9 @@ struct LfmWorkspace {
     seen.resize(static_cast<size_t>(model.vocab));
     seen_tokens.reserve(static_cast<size_t>(model.max_ctx));
     std::memcpy(prefill_inputs[bindings.prefill_cos].data(), model.rope_cos.data(),
-                model.rope_cos.size());
+                prefill_inputs[bindings.prefill_cos].size());
     std::memcpy(prefill_inputs[bindings.prefill_sin].data(), model.rope_sin.data(),
-                model.rope_sin.size());
+                prefill_inputs[bindings.prefill_sin].size());
     std::memcpy(prefill_inputs[bindings.prefill_mask].data(), model.prefill_mask.data(),
                 model.prefill_mask.size());
     return true;
@@ -459,22 +484,30 @@ class KvStateLease {
  public:
   KvStateLease(const LfmBindings& bindings, Buffers& prefill_outputs, Buffers& decode_inputs)
       : bindings_(bindings), prefill_outputs_(prefill_outputs), decode_inputs_(decode_inputs) {
-    swap();
+    for (const auto& transfer : bindings_.prefill_kv_to_decode) {
+      Buffer& source = prefill_outputs_[transfer.source];
+      Buffer& destination = decode_inputs_[transfer.destination];
+      if (source.size() == destination.size()) {
+        source.swap(destination);
+        swapped_.push_back(transfer);
+      } else {
+        std::memcpy(destination.data(), source.data(), source.size());
+      }
+    }
   }
 
-  ~KvStateLease() { swap(); }
+  ~KvStateLease() {
+    for (const auto& transfer : swapped_)
+      prefill_outputs_[transfer.source].swap(decode_inputs_[transfer.destination]);
+  }
   KvStateLease(const KvStateLease&) = delete;
   KvStateLease& operator=(const KvStateLease&) = delete;
 
  private:
-  void swap() noexcept {
-    for (const auto& transfer : bindings_.prefill_kv_to_decode)
-      prefill_outputs_[transfer.source].swap(decode_inputs_[transfer.destination]);
-  }
-
   const LfmBindings& bindings_;
   Buffers& prefill_outputs_;
   Buffers& decode_inputs_;
+  std::vector<TensorTransfer> swapped_;
 };
 
 float adjusted_logit(const Buffer& logits, size_t token, const qhx_gen_cfg& config,
@@ -609,28 +642,43 @@ void copy_rope_row(const qhx_model& model, const LfmBindings& bindings, int posi
 }  // namespace
 
 bool prepare_lfm_model(qhx_model& model, std::string& error) {
+  size_t x_index = 0;
   size_t cos_index = 0;
   size_t sin_index = 0;
   size_t mask_index = 0;
-  if (!require_tensor(model.prefill->inputs, "cos", cos_index, error) ||
+  if (!require_tensor(model.prefill->inputs, "x", x_index, error) ||
+      !require_tensor(model.prefill->inputs, "cos", cos_index, error) ||
       !require_tensor(model.prefill->inputs, "sin", sin_index, error) ||
       !require_tensor(model.prefill->inputs, "cmask", mask_index, error)) {
     return false;
   }
-  const size_t rope_bytes = static_cast<size_t>(model.max_ctx) * model.head_dim * 2U;
-  const size_t mask_bytes = static_cast<size_t>(model.max_ctx) * model.max_ctx * 2U;
-  if (!validate_bytes(model.prefill->inputs[cos_index], rope_bytes, "prefill.cos", error) ||
-      !validate_bytes(model.prefill->inputs[sin_index], rope_bytes, "prefill.sin", error) ||
+  const auto& x = model.prefill->inputs[x_index];
+  if (x.dimensions.size() != 2 || x.dimensions[0] == 0 ||
+      x.dimensions[0] > static_cast<uint32_t>(model.max_ctx) ||
+      x.dimensions[1] != static_cast<uint32_t>(model.hidden)) {
+    error = "LFM prefill.x dimensions do not match the model contract";
+    return false;
+  }
+  model.prefill_ctx = static_cast<int>(x.dimensions[0]);
+  const size_t prefill_rope_bytes =
+      static_cast<size_t>(model.prefill_ctx) * model.head_dim * 2U;
+  const size_t mask_bytes =
+      static_cast<size_t>(model.prefill_ctx) * model.prefill_ctx * 2U;
+  if (!validate_bytes(model.prefill->inputs[cos_index], prefill_rope_bytes,
+                      "prefill.cos", error) ||
+      !validate_bytes(model.prefill->inputs[sin_index], prefill_rope_bytes,
+                      "prefill.sin", error) ||
       !validate_bytes(model.prefill->inputs[mask_index], mask_bytes, "prefill.cmask", error)) {
     return false;
   }
+  const size_t rope_bytes = static_cast<size_t>(model.max_ctx) * model.head_dim * 2U;
   model.rope_cos.resize(rope_bytes);
   model.rope_sin.resize(rope_bytes);
   model.prefill_mask.resize(mask_bytes);
   model.decode_mask_base.resize(static_cast<size_t>(model.max_ctx) * 2U);
   fill_rope_table(model.rope_cos, model.rope_sin, model.max_ctx, model.head_dim,
                   model.rope_theta);
-  fill_prefill_mask(model.prefill_mask, model.max_ctx);
+  fill_prefill_mask(model.prefill_mask, model.prefill_ctx);
   fill_decode_mask_base(model.decode_mask_base, model.max_ctx);
   return true;
 }
@@ -654,11 +702,12 @@ qhx_status run_lfm(qhx_session& session, const qhx_inputs& inputs, const qhx_gen
   workspace.begin_generation(model);
   if (profile)
     workspace.timings.preparation_ms += elapsed_ms(initialize_workspace_start, Clock::now());
-  workspace.tokens.push_back(1);
+  workspace.tokens.push_back(model.bos_token_id);
   if (!model.tokenizer->encode(chat_prompt(inputs), workspace.tokens, error))
     return QHX_ERROR_MODEL;
-  if (workspace.tokens.empty() || static_cast<int>(workspace.tokens.size()) >= model.max_ctx) {
-    error = "Prompt exceeds the LFM context window";
+  if (workspace.tokens.empty() ||
+      static_cast<int>(workspace.tokens.size()) >= model.prefill_ctx) {
+    error = "Prompt exceeds the LFM prefill window";
     return QHX_ERROR_INVALID_ARGUMENT;
   }
   for (int32_t token : workspace.tokens) workspace.mark_seen(token);

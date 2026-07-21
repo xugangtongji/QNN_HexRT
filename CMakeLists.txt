@@ -13,12 +13,23 @@ if(NOT EXISTS "${QAIRT_ROOT}/include/QNN/QnnInterface.h")
   message(FATAL_ERROR "Invalid QAIRT SDK root: ${QAIRT_ROOT}")
 endif()
 
-add_library(qhexrt_core STATIC src/qhexrt_c.cpp)
+add_library(qhexrt_core STATIC
+  src/lfm_manifest.cpp
+  src/model_capabilities.cpp
+  src/qhexrt_c.cpp)
 add_library(qhexrt_host STATIC
   src/read_only_mapping.cpp
   src/qnn_runtime.cpp
   src/tokenizer.cpp
   src/lfm_runner.cpp)
+
+option(QHX_ENABLE_LFM2_5_350M_CANDIDATE
+  "Enable the device-validation-only LFM2.5-350M execution candidate" OFF)
+if(QHX_ENABLE_LFM2_5_350M_CANDIDATE)
+  target_compile_definitions(qhexrt_core PRIVATE
+    QHX_ENABLE_LFM2_5_350M_CANDIDATE=1)
+endif()
+
 foreach(target qhexrt_core qhexrt_host)
   target_compile_features(${target} PUBLIC cxx_std_20)
   target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror

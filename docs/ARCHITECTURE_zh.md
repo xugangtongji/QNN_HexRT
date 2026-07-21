@@ -9,6 +9,8 @@ QHexRT 是专为高通 Hexagon DSP 优化的高性能大基座模型（LFM）推
 ### 1.1 接口层 (`qhexrt_core`)
 - **稳定性**：提供稳定的 C ABI (`qhexrt_c.h`)，确保跨不同 Android NDK 版本和语言（C++、Java/JNI、Rust）的兼容性。
 - **会话隔离**：通过不透明句柄（Opaque Handles）管理 `qhx_runtime`、`qhx_model` 和 `qhx_session`，确保线程安全和资源隔离。
+- **模型能力注册表**：统一维护类型化模型 ID、架构掩码、支持状态、Runner
+  类型和图契约。Manifest 必须先通过注册表解析，之后才允许打开工件和 QNN 图。
 
 ### 1.2 编排层 (`qhexrt_host`)
 - **LFM Runner**：核心状态机。管理 **Prefill**（批处理）与 **Decode**（循环生成）之间的切换。维护逻辑 KV-Cache 状态及对话历史。
@@ -18,6 +20,9 @@ QHexRT 是专为高通 Hexagon DSP 优化的高性能大基座模型（LFM）推
 ### 1.3 硬件抽象层 (`qnn_runtime`)
 - **QNN 集成**：对接 `libQnnHtp.so` 和 `libQnnSystem.so`。
 - **图形管理**：加载并管理多个 HTP 图形（Prefill、Decode、LMHead）。
+- **共享 Context 所有权**：多个图句柄可以共享同一个反序列化 QNN Context。
+  V79 LFM2.5-350M 的 Prefill 与 Decode 使用该路径，避免重复加载约 581 MB
+  的主体 Context。
 - **张量绑定**：利用 QNN 的 RPC/Ion 内存分配器，实现 CPU 与 DSP 之间的零拷贝内存共享。
 
 ---
@@ -29,7 +34,8 @@ QHexRT 是专为高通 Hexagon DSP 优化的高性能大基座模型（LFM）推
 graph TD
     UserApp[用户应用 / JNI] --> CAPI[C-API qhexrt_core]
     subgraph QHexRT 宿主层
-        CAPI --> Runner[LFM Runner]
+        CAPI --> Registry[模型能力注册表]
+        Registry --> Runner[LFM Runner]
         Runner --> Tokenizer[Tokenizer]
         Runner --> Sampler[采样器]
         Runner --> MemMgr[内存管理 / mmap]
@@ -79,6 +85,11 @@ LFM 模型被切分为三个独立的图形，以最大化 HTP 利用率：
 1.  **Prefill 图形**：并行处理多个 Token。针对初始提示词处理时的最大吞吐量进行优化。
 2.  **Decode 图形**：仅处理一个 Token。针对最小延迟（首字延迟和 Token 间延迟）进行优化。
 3.  **LMHead 图形**：独立切分，允许宿主侧在不重新运行完整骨干网络的情况下，进行复杂的采样或 Logit 操作。
+
+Prefill 和 Decode 的序列容量是相互独立的类型化维度。V79
+LFM2.5-350M/2048 契约最多 Prefill 512 个 Token，而 Decode 维护 2048 个
+Token 的 KV 状态。Runner 将较短的 Prefill KV 输出复制到较大的 Decode
+Buffer 前缀；对于等长契约则继续使用原有的 Buffer 交换快速路径。
 
 ### 3.2 内存映射 (mmap)
 权重和序列化的图形工件通过 `mmap(PROT_READ)` 加载。

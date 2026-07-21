@@ -33,6 +33,18 @@ struct Runtime {
   bool initialize(const char* htp_path, const char* system_path);
 };
 
+struct ContextBinary {
+  Runtime* runtime = nullptr;
+  Qnn_ContextHandle_t context = nullptr;
+  std::string path;
+
+  ContextBinary() = default;
+  ~ContextBinary();
+  ContextBinary(const ContextBinary&) = delete;
+  ContextBinary& operator=(const ContextBinary&) = delete;
+  bool load(Runtime& runtime, const std::string& path, std::string& error);
+};
+
 struct ContextGraph {
   struct TensorDef {
     uint32_t id = 0;
@@ -46,15 +58,16 @@ struct ContextGraph {
     std::vector<Qnn_Tensor_t> inputs;
     std::vector<Qnn_Tensor_t> outputs;
   };
+  std::shared_ptr<ContextBinary> context_binary;
   Runtime* runtime = nullptr;
-  Qnn_ContextHandle_t context = nullptr;
   Qnn_GraphHandle_t graph = nullptr;
   std::string graph_name;
   std::vector<TensorDef> inputs;
   std::vector<TensorDef> outputs;
-  ~ContextGraph();
   bool load(Runtime& runtime, const std::string& path, const std::string& expected_graph,
             std::string& error);
+  bool load(const std::shared_ptr<ContextBinary>& context,
+            const std::string& expected_graph, std::string& error);
   [[nodiscard]] Bindings create_bindings() const;
   bool execute(Bindings& bindings, std::vector<std::vector<uint8_t>>& input_buffers,
                std::vector<std::vector<uint8_t>>& output_buffers, std::string& error);

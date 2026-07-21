@@ -283,25 +283,55 @@ bool Runtime::initialize(const char* htp_path, const char* system_path) {
   return true;
 }
 
-ContextGraph::~ContextGraph() {
-  if (context && runtime && runtime->qnn.contextFree) runtime->qnn.contextFree(context, nullptr);
+ContextBinary::~ContextBinary() {
+  if (context && runtime && runtime->qnn.contextFree) {
+    runtime->qnn.contextFree(context, nullptr);
+  }
 }
 
-bool ContextGraph::load(Runtime& rt, const std::string& path, const std::string& expected_graph,
-                        std::string& error) {
+bool ContextBinary::load(Runtime& rt, const std::string& binary_path,
+                         std::string& error) {
+  if (context != nullptr) {
+    error = "QNN context binary is already loaded";
+    return false;
+  }
   ReadOnlyMapping binary;
-  if (!binary.open(path, MappingAccess::kNormal, error)) return false;
+  if (!binary.open(binary_path, MappingAccess::kNormal, error)) return false;
   runtime = &rt;
-  if (!clone_graph_metadata(rt, binary.bytes(), expected_graph, inputs, outputs, error)) return false;
   if (!rt.qnn.contextCreateFromBinary ||
       rt.qnn.contextCreateFromBinary(rt.backend, rt.device, nullptr, binary.data(), binary.size(),
                                      &context, nullptr) != QNN_SUCCESS) {
-    error = "QNN contextCreateFromBinary failed: " + path;
+    error = "QNN contextCreateFromBinary failed: " + binary_path;
     return false;
   }
+  path = binary_path;
+  return true;
+}
+
+bool ContextGraph::load(Runtime& rt, const std::string& path,
+                        const std::string& expected_graph, std::string& error) {
+  auto binary = std::make_shared<ContextBinary>();
+  if (!binary->load(rt, path, error)) return false;
+  return load(binary, expected_graph, error);
+}
+
+bool ContextGraph::load(const std::shared_ptr<ContextBinary>& binary,
+                        const std::string& expected_graph, std::string& error) {
+  if (!binary || !binary->runtime || !binary->context || binary->path.empty()) {
+    error = "Invalid QNN context binary";
+    return false;
+  }
+  ReadOnlyMapping mapping;
+  if (!mapping.open(binary->path, MappingAccess::kNormal, error)) return false;
+  if (!clone_graph_metadata(*binary->runtime, mapping.bytes(), expected_graph,
+                            inputs, outputs, error)) {
+    return false;
+  }
+  context_binary = binary;
+  runtime = binary->runtime;
   graph_name = expected_graph;
-  if (!rt.qnn.graphRetrieve ||
-      rt.qnn.graphRetrieve(context, graph_name.c_str(), &graph) != QNN_SUCCESS) {
+  if (!runtime->qnn.graphRetrieve ||
+      runtime->qnn.graphRetrieve(binary->context, graph_name.c_str(), &graph) != QNN_SUCCESS) {
     error = "QNN graphRetrieve failed for: " + graph_name;
     return false;
   }

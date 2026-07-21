@@ -12,10 +12,36 @@ QHexRT is a high-performance inference runtime designed for running Large Founda
 *   **Highly Configurable**: Control over temperature, top-p, top-k, repetition penalties, and more.
 *   **Android Native**: Built for `arm64-v8a` Android environments.
 
+### Model Capabilities
+
+QHexRT ABI 1.3 exposes a typed, runtime-owned model-capability registry. A
+`DECLARED` entry identifies a model adapter boundary; only an `EXECUTABLE`
+entry has a graph contract and runner implemented by the current build.
+
+| Catalog ID | Runner | Architectures | State |
+|---|---|---|---|
+| `qwen3_5_0_8b` | Qwen3.5 | v75, v79, v81 | Declared |
+| `lfm2_5_350m` | LFM2 | v79 | Declared |
+| `qwen3_0_6b` | Qwen3 | v75, v81 | Declared |
+| `lfm2_5_230m` | LFM2 | v75, v79, v81 | Executable |
+
+Use `qhx_model_capabilities()` to enumerate the records and
+`qhx_model_capability_find()` for typed lookup. A catalog row must not be
+treated as loadable unless its state is `QHX_MODEL_SUPPORT_EXECUTABLE` and its
+architecture mask contains the current device architecture.
+
+The V79 `lfm2-5-350m-2048` shared-context loader and runner contract are
+implemented in ABI 1.3. Its capability intentionally remains `DECLARED` until
+the existing `qhx_generate` CLI produces valid output on a real V79 device.
+Validation APK builds may opt in with
+`QHX_ENABLE_LFM2_5_350M_CANDIDATE=ON`; the option defaults to `OFF`.
+
 ### Architecture
 
 QHexRT consists of:
 - `qhexrt_core`: The core inference logic and C-API implementation.
+- `model_capabilities`: Typed model identity, runner, graph-contract, and
+  architecture policy owned by the core runtime.
 - `qhexrt_host`: Host-side runtime management, including tokenizer and QNN environment setup.
 - `qhx_generate`: A smoke-test CLI tool for device-side testing.
 
